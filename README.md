@@ -21,38 +21,45 @@
 напомни каждый понедельник в 10:00 про планёрку
 ```
 
-## 🚀 Быстрый старт
+## 🚀 Установка одной командой
 
-### 1. Создай бота
-
-Напиши [@BotFather](https://t.me/BotFather) → `/newbot` → сохрани токен.
-
-### 2. Клонируй репозиторий
+Нужен сервер с Ubuntu и установленным Docker.
 
 ```bash
-git clone https://github.com/ВАШ_НИК/reminder-bot.git
-cd reminder-bot
+curl -sSL https://raw.githubusercontent.com/wellbob/reminder-bot/main/setup.sh | bash
 ```
 
-### 3. Настрой окружение
+Скрипт сам:
+1. Проверит наличие Docker
+2. Спросит токен бота (получи у [@BotFather](https://t.me/BotFather))
+3. Скачает файлы, соберёт образ и запустит бота
+4. Выведет полезные команды для управления
+
+## 📌 Команды бота
+
+| Команда | Описание |
+|---|---|
+| `/start` | Приветствие и примеры |
+| `/list` | Список активных напоминаний |
+| `/cancel <id>` | Отменить разовое напоминание |
+| `/cancel r<id>` | Отменить повторяющееся |
+
+## ⚙️ Управление после установки
 
 ```bash
-cp .env.example .env
-nano .env  # вставь свой BOT_TOKEN
-```
+cd /opt/reminder-bot
 
-### 4. Запусти
-
-```bash
-chmod +x setup.sh && ./setup.sh
-```
-
-Или вручную:
-
-```bash
-docker compose build
-docker compose up -d
+# Логи в реальном времени
 docker compose logs -f reminder-bot
+
+# Остановить
+docker compose stop reminder-bot
+
+# Перезапустить
+docker compose restart reminder-bot
+
+# Обновить до последней версии
+git pull && docker compose build && docker compose up -d
 ```
 
 ## 🗂 Структура проекта
@@ -63,10 +70,9 @@ reminder-bot/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
-├── setup.sh            # Скрипт быстрого развёртывания
+├── setup.sh            # Скрипт установки
 ├── .env.example        # Шаблон переменных окружения
-├── .gitignore
-└── data/               # SQLite база (создаётся автоматически, в git не входит)
+└── .gitignore
 ```
 
 ## ⚙️ Стек
@@ -79,15 +85,6 @@ reminder-bot/
 | Распознавание речи | OpenAI Whisper (tiny, локально) |
 | База данных | SQLite |
 | Деплой | Docker + Docker Compose |
-
-## 📌 Команды бота
-
-| Команда | Описание |
-|---|---|
-| `/start` | Приветствие и примеры |
-| `/list` | Список активных напоминаний |
-| `/cancel <id>` | Отменить разовое напоминание |
-| `/cancel r<id>` | Отменить повторяющееся |
 
 ## 🔒 Безопасность
 

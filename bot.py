@@ -29,6 +29,9 @@ from telegram.ext import (
 
 # ── Настройки ────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+# Кому слать уведомление о перезапуске. Если пусто — возьмём из базы.
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")
+BOT_VERSION = "1.2.0"
 TIMEZONE  = "Europe/Moscow"
 TZ        = ZoneInfo(TIMEZONE)
 DB_PATH   = "/data/reminders.db"
@@ -176,24 +179,33 @@ def is_reminder(text: str) -> bool:
 
 def extract_subject(text: str) -> str:
     """Извлекает тему напоминания."""
-    # Попытка 1: берём всё после «про/об» — самый надёжный способ
+    # Попытка 1: всё после «про/об» — самый надёжный способ
     m = re.search(r'\b(?:про|об)\s+(.+)', text, re.IGNORECASE | re.DOTALL)
     if m:
         subject = m.group(1).strip()
-        # Убираем хвосты если время/дата попала в конец
+        # Отрезаем время/дату, если она оказалась в конце
         subject = re.sub(
-            r'\s+(?:через\s+[\w\s]+|в\s+\d{1,2}:\d{2})\s*$', '',
+            r'\s+(?:через\s+[\w\s:.]+|в\s+\d{1,2}:\d{2})\s*$', '',
             subject, flags=re.IGNORECASE
         ).strip()
         return subject
 
-    # Попытка 2: убираем временны́е конструкции и ключевые слова
+    # Попытка 2: если есть «через» — тема это то, что осталось после длительности
+    pos = text.lower().find("через")
+    if pos != -1:
+        _td, rest, _amb = _parse_duration(text[pos + len("через"):])
+        rest = rest.strip(" ,.—-")
+        # Убираем связки в начале: «чтобы я не забыл ...»
+        rest = re.sub(r'^(?:чтобы\s+(?:я\s+)?не\s+забыл[а-я]*|чтобы|что)\s+', '', rest, flags=re.IGNORECASE)
+        if rest:
+            return rest.strip(" ,.")
+
+    # Попытка 3: чистим временны́е конструкции
     cleaned = re.sub(
         r'напомни(те|ть)?(\s+мне)?'
         r'|\bв\s+\d{1,2}[./]\d{1,2}[./]\d{2,4}\s+в\s+\d{1,2}[:\.]?\d*'
         r'|\bв\s+\d{1,2}[./]\d{1,2}[./]\d{2,4}'
         r'|\bв\s+\d{1,2}:\d{2}'
-        r'|\bчерез\s+(?:полтора\s+)?(?:\d+\s+)?(?:час|минут|мин|день|дн|недел|секунд)\w*'
         r'|\bзавтра|\bпослезавтра'
         r'|\bнесколько\s+раз'
         r'|\bкаждый\s+\w+',
@@ -214,21 +226,123 @@ DAYS_APSched = {
 }
 
 
-def _parse_single_offset(expr: str):
-    expr = expr.strip().lower()
-    if re.search(r"полтора\s*час", expr): return timedelta(hours=1, minutes=30)
-    if re.search(r"пол\s*час", expr):     return timedelta(minutes=30)
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(недел|день|дн|сутк|час|мин)", expr)
-    if m:
-        val = float(m.group(1).replace(",", "."))
-        unit = m.group(2)
-        if unit.startswith("недел"): return timedelta(weeks=val)
-        if unit in ("день", "дн", "сутк"): return timedelta(days=val)
-        if unit.startswith("час"): return timedelta(hours=val)
-        return timedelta(minutes=val)
-    if re.search(r"\bчас", expr): return timedelta(hours=1)
-    if re.search(r"\bмин", expr): return timedelta(minutes=1)
+# Словесные числительные
+NUM_WORDS = {
+    "ноль": 0, "один": 1, "одну": 1, "одна": 1, "одного": 1,
+    "полтора": 1.5, "полторы": 1.5,
+    "два": 2, "две": 2, "пара": 2, "пару": 2, "двух": 2,
+    "три": 3, "трех": 3, "трёх": 3, "четыре": 4, "четырех": 4, "четырёх": 4,
+    "пять": 5, "пяти": 5, "шесть": 6, "шести": 6, "семь": 7, "семи": 7,
+    "восемь": 8, "восьми": 8, "девять": 9, "девяти": 9, "десять": 10, "десяти": 10,
+    "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14,
+    "пятнадцать": 15, "шестнадцать": 16, "семнадцать": 17, "восемнадцать": 18,
+    "девятнадцать": 19, "двадцать": 20, "двадцати": 20,
+    "тридцать": 30, "тридцати": 30, "сорок": 40, "сорока": 40,
+    "пятьдесят": 50, "пятидесяти": 50,
+}
+
+
+def _unit_of(word: str):
+    """Определяет единицу времени по слову ('часа' → hours)."""
+    if re.match(r"^недел", word):        return "weeks"
+    if re.match(r"^(сутк|дн|ден)", word): return "days"
+    if re.match(r"^час", word):          return "hours"
+    if re.match(r"^мин", word):          return "minutes"
+    if re.match(r"^сек", word):          return "seconds"
     return None
+
+
+def _parse_duration(s: str):
+    """
+    Разбирает длительность с начала строки.
+    Понимает: «1:20», «час двадцать», «2 часа 30 минут», «полтора часа»,
+              «полчаса», «26 дней», «через минуту».
+
+    Возвращает (timedelta | None, остаток_строки, неоднозначное_число | None).
+    Неоднозначное число — когда указано число без единицы («через 4»).
+    """
+    parts = {"weeks": 0, "days": 0, "hours": 0, "minutes": 0, "seconds": 0}
+    pending = None          # число, ожидающее свою единицу
+    found_any = False
+    consumed_end = 0
+
+    tokens = list(re.finditer(r"\d+\s*[:.]\s*\d+|\d+|[а-яёa-z]+", s, re.IGNORECASE))
+
+    for i, tok in enumerate(tokens):
+        w = tok.group(0).lower().strip()
+
+        # Формат Ч:ММ — «1:20», «3.53»
+        m = re.match(r"^(\d+)\s*[:.]\s*(\d+)$", w)
+        if m and not found_any and pending is None:
+            parts["hours"] += int(m.group(1))
+            parts["minutes"] += int(m.group(2))
+            found_any = True
+            consumed_end = tok.end()
+            continue
+
+        # «полчаса»
+        if w in ("полчаса", "полчасика"):
+            parts["minutes"] += 30
+            found_any = True
+            consumed_end = tok.end()
+            continue
+
+        # Союз «и» — пропускаем, если дальше есть продолжение длительности
+        if w == "и" and i + 1 < len(tokens):
+            nxt = tokens[i + 1].group(0).lower()
+            if nxt.isdigit() or nxt in NUM_WORDS or _unit_of(nxt) or re.match(r"^\d+[:.]\d+$", nxt):
+                continue
+            break
+
+        # Число цифрами
+        if w.isdigit():
+            if pending is not None:
+                break
+            pending = float(w)
+            consumed_end = tok.end()
+            continue
+
+        # Число словом
+        if w in NUM_WORDS:
+            if pending is not None:
+                break
+            pending = NUM_WORDS[w]
+            consumed_end = tok.end()
+            continue
+
+        # Единица измерения
+        unit = _unit_of(w)
+        if unit:
+            parts[unit] += pending if pending is not None else 1
+            pending = None
+            found_any = True
+            consumed_end = tok.end()
+            continue
+
+        # Незнакомое слово — длительность закончилась
+        break
+
+    # Остался «висячий» хвост: «час двадцать» → 20 минут
+    if pending is not None:
+        if found_any and parts["hours"] > 0 and parts["minutes"] == 0:
+            parts["minutes"] += pending
+        else:
+            return None, s, pending      # «через 4» — непонятная единица
+
+    if not found_any:
+        return None, s, None
+
+    td = timedelta(
+        weeks=parts["weeks"], days=parts["days"], hours=parts["hours"],
+        minutes=parts["minutes"], seconds=parts["seconds"],
+    )
+    return td, s[consumed_end:], None
+
+
+def _parse_single_offset(expr: str):
+    """Совместимость со старым кодом: только timedelta."""
+    td, _, _ = _parse_duration(expr)
+    return td
 
 
 def _parse_time_str(s: str):
@@ -290,7 +404,7 @@ def parse_times(text: str):
         try:
             dt = datetime(yr, mon, day, h, mn, 0, tzinfo=TZ)
             if dt > now:
-                return [dt], False
+                return [dt], False, None
         except ValueError:
             pass
 
@@ -311,32 +425,30 @@ def parse_times(text: str):
                     hour=int(time_m.group(1)), minute=int(time_m.group(2))
                 )
                 if base > now:
-                    return [base], False
+                    return [base], False, None
             elif base > now:
-                return [base], True   # спросим время
+                return [base], True, None   # спросим время
         except ValueError:
             pass
 
-    # 1. через X и Y
-    m = re.search(
-        r"через\s+([\w\s,.]+?(?:час|мин)[а-я]*)"
-        r"\s+и\s+"
-        r"((?:через\s+)?[\w\s,.]+?(?:час|мин)[а-я]*)",
-        t,
-    )
-    if m:
-        for raw in [m.group(1), m.group(2)]:
-            raw = re.sub(r"^через\s+", "", raw.strip())
-            delta = _parse_single_offset(raw)
+    # 1. Несколько напоминаний: «несколько раз через X и Y» / «через X и через Y»
+    multi = re.search(r"несколько\s+раз", t) or re.search(r"через\s+.+?\s+и\s+через\s+", t)
+    if multi:
+        for chunk in re.split(r"\s+и\s+", t.split("через", 1)[-1]):
+            chunk = re.sub(r"^\s*через\s+", "", chunk.strip())
+            delta, _, _ = _parse_duration(chunk)
             if delta:
                 times.append(now + delta)
         if times:
-            return times, False
+            return times, False, None
 
-    # 2. через X
-    m = re.search(r"через\s+(.+?)(?:\s+(?:про|чтобы|что|об|о)\b|$)", t)
-    if m:
-        delta = _parse_single_offset(m.group(1).strip())
+    # 2. через X — одна длительность
+    pos = t.find("через")
+    if pos != -1:
+        after = t[pos + len("через"):]
+        delta, _rest, ambiguous = _parse_duration(after)
+        if ambiguous is not None:
+            return [], False, ambiguous      # «через 4» — попросим уточнить единицу
         if delta:
             target = now + delta
             if delta.total_seconds() >= 86400:
@@ -346,9 +458,9 @@ def parse_times(text: str):
                         hour=int(time_m.group(1)), minute=int(time_m.group(2)),
                         second=0, microsecond=0,
                     )
-                    return [target], False
-                return [target], True
-            return [target], False
+                    return [target], False, None
+                return [target], True, None
+            return [target], False, None
 
     # 3. завтра/послезавтра
     day_offset = 0
@@ -359,8 +471,8 @@ def parse_times(text: str):
         m = re.search(r"в\s+(\d{1,2}):(\d{2})", t)
         if m:
             dt = base.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
-            return [dt], False
-        return [base], True
+            return [dt], False, None
+        return [base], True, None
 
     # 4. день недели
     for day_name, day_num in DAYS_RU.items():
@@ -370,8 +482,8 @@ def parse_times(text: str):
             m = re.search(r"в\s+(\d{1,2}):(\d{2})", t)
             if m:
                 dt = base.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
-                return [dt], False
-            return [base], True
+                return [dt], False, None
+            return [base], True, None
 
     # 5. в HH:MM (только через двоеточие, чтобы не путать с датой DD.MM)
     m = re.search(r"\bв\s+(\d{1,2}):(\d{2})", t)
@@ -379,14 +491,14 @@ def parse_times(text: str):
         dt = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
         if dt <= now:
             dt += timedelta(days=1)
-        return [dt], False
+        return [dt], False, None
 
     # 6. fallback
     dt = dateparser.parse(text, languages=["ru"], settings=DATEPARSER_SETTINGS)
     if dt and dt > now:
-        return [dt], False
+        return [dt], False, None
 
-    return [], False
+    return [], False, None
 
 
 # ── Снуз-кнопки ─────────────────────────────────────────────────────────────
@@ -429,7 +541,10 @@ async def handle_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _, minutes_str, rid_str = data.split(":")
         minutes = int(minutes_str)
         chat_id = query.message.chat_id
-        subject = re.sub(r"^⏰ \*Напоминание:\* ", "", query.message.text)
+        # Telegram отдаёт текст без Markdown-разметки, поэтому звёздочки необязательны.
+        # Также отсекаем ранее приклеенные пометки «Отложено на ...».
+        raw = query.message.text.split("\n\n")[0]
+        subject = re.sub(r"^⏰\s*\*?Напоминание:\*?\s*", "", raw).strip()
 
         fire_at = datetime.now(tz=TZ) + timedelta(minutes=minutes)
         new_rid = save_reminder(chat_id, fire_at, subject)
@@ -568,8 +683,16 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    times, need_time = parse_times(recognized)
+    times, need_time, ambiguous = parse_times(recognized)
     subject = extract_subject(recognized)
+
+    if ambiguous is not None:
+        n = int(ambiguous)
+        await update.message.reply_text(
+            f"🤔 Через {n} чего? Уточни единицу:\n"
+            f"• «через {n} минут»\n• «через {n} часа»\n• «через {n} дней»"
+        )
+        return
 
     if not times:
         await update.message.reply_text("🤔 Не смог разобрать время. Попробуй ещё раз.")
@@ -592,14 +715,21 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Пиши или говори — я напомню.\n\n"
-        "*Разовые напоминания:*\n"
+        "*Через сколько:*\n"
+        "• напомни через 45 минут выключить духовку\n"
+        "• напомни через 1:20 оплатить кредит\n"
+        "• напомни через час двадцать позвонить маме\n"
+        "• напомни через полтора часа про звонок\n"
+        "• напомни через 26 дней про оплату форнекс\n\n"
+        "*К дате и времени:*\n"
         "• напомни завтра в 9:00 про отчёт\n"
-        "• напомни через 26 дней про оплату форнекс\n"
-        "• напомни через час и полтора часа про звонок\n"
-        "• напомни в пятницу в 18:00 про встречу\n\n"
+        "• напомни в пятницу в 18:00 про встречу\n"
+        "• напомни в 25.12.2026 в 10:00 про подарки\n\n"
         "*Повторяющиеся:*\n"
         "• напомни каждый день в 9:00 про зарядку\n"
         "• напомни каждый понедельник в 10:00 про отчёт\n\n"
+        "*Несколько раз:*\n"
+        "• напомни несколько раз через час и два часа про это\n\n"
         "🎙 Можно отправить голосовое сообщение!\n\n"
         "*/list* — активные напоминания\n"
         "*/cancel <id>* — отменить\n"
@@ -706,12 +836,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    times, need_time = parse_times(text)
+    times, need_time, ambiguous = parse_times(text)
     subject = extract_subject(text)
+
+    if ambiguous is not None:
+        n = int(ambiguous)
+        await update.message.reply_text(
+            f"🤔 Через {n} чего? Уточни единицу:\n"
+            f"• «через {n} минут»\n• «через {n} часа»\n• «через {n} дней»"
+        )
+        return ConversationHandler.END
 
     if not times:
         await update.message.reply_text(
             "🤔 Не смог разобрать время. Попробуй чуть точнее, например:\n"
+            "«напомни через 1:20 оплатить кредит»\n"
             "«напомни через 26 дней в 12:00 про оплату»"
         )
         return ConversationHandler.END
@@ -765,9 +904,62 @@ async def cancel_dialog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Запуск ───────────────────────────────────────────────────────────────────
+def _get_notify_chat_id():
+    """Кому слать уведомление о запуске: из env или последний чат из базы."""
+    if OWNER_CHAT_ID.strip():
+        try:
+            return int(OWNER_CHAT_ID.strip())
+        except ValueError:
+            log.warning("OWNER_CHAT_ID задан некорректно, игнорирую.")
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute(
+            "SELECT chat_id FROM reminders ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        con.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+async def notify_startup(bot):
+    """Сообщает владельцу, что бот перезапущен после обновления."""
+    chat_id = _get_notify_chat_id()
+    if not chat_id:
+        log.info("Некому слать уведомление о запуске (нет chat_id).")
+        return
+
+    # Считаем, сколько напоминаний пережило перезапуск
+    try:
+        con = sqlite3.connect(DB_PATH)
+        pending = con.execute(
+            "SELECT COUNT(*) FROM reminders WHERE sent=0 AND chat_id=?", (chat_id,)
+        ).fetchone()[0]
+        recur = con.execute(
+            "SELECT COUNT(*) FROM recurring WHERE active=1 AND chat_id=?", (chat_id,)
+        ).fetchone()[0]
+        con.close()
+    except Exception:
+        pending = recur = 0
+
+    text = (
+        f"🔄 *Бот обновлён и запущен*\n"
+        f"Версия: `{BOT_VERSION}`\n"
+        f"Время: {datetime.now(tz=TZ).strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"Активных напоминаний: *{pending}*\n"
+        f"Повторяющихся: *{recur}*"
+    )
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        log.info(f"Уведомление о запуске отправлено в чат {chat_id}.")
+    except Exception as e:
+        log.warning(f"Не удалось отправить уведомление о запуске: {e}")
+
+
 async def post_init(app: Application):
     scheduler.start()
     await reload_pending_jobs(app.bot)
+    await notify_startup(app.bot)
 
 
 def main():
